@@ -1,5 +1,4 @@
 from collections.abc import Sequence
-import functools
 import time
 
 from absl import app
@@ -30,7 +29,7 @@ def run_benchmark(
 
   # 1. Simplified Kernel
   def run_simplified():
-    return attention.flash_attention(
+    return simplified_kernel.flash_attention(
         q, k, v, blk_q=blk_q, blk_kv=blk_kv
     )
 
@@ -100,34 +99,6 @@ def main(argv: Sequence[str]) -> None:
       run_benchmark(name, b, h, ql, kl, d)
     except Exception as e:
       print(f"❌ Failed case {name}: {e}")
-
-  # Finally, try Pacchetto on the simplified kernel for the Helion case
-  print("\n--- Attempting Pacchetto for Simplified Kernel ---")
-  q, k, v = example_utils.sample_qkv(2, 32, 1024, 1024, 128, dtype=jnp.bfloat16)
-
-  from google3.platforms.xla.tools import pacchetto as pc
-
-  # Use named_scope so pacchetto can find it
-  func = jax.named_scope("simplified_kernel_pacchetto")(
-      lambda q, k, v: attention.flash_attention(
-          q, k, v, blk_q=128, blk_kv=128
-      )
-  )
-
-  try:
-    bundles = pc.get_bundles(
-        func,
-        hlo_pattern=".*",
-        enable_trace=True,
-    )(q, k, v)
-    print("Got bundles. Parsing POST_RA...")
-    parsed_bundle = bundles.get_parsed_bundles(pc.BundleType.POST_RA)
-    print("Parsed. Dumping to sponge...")
-    parsed_bundle.dump_to_sponge(name="pacchetto-simplified-flash-attn")
-    print("✅ Successfully dumped Pacchetto trace to Sponge!")
-  except Exception as e:
-    print(f"❌ Pacchetto failed: {e}")
-
 
 if __name__ == "__main__":
   app.run(main)
