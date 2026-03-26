@@ -1,8 +1,9 @@
+import functools
+import math
 import jax
 from jax import numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
-import functools
 
 
 def _flash_attention_kernel(
@@ -111,7 +112,7 @@ def _flash_attention_kernel(
     logits = jax.lax.dot_general(
         q, k, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
     )
-    logits = (logits * sm_scale).astype(jnp.float32)
+    logits = (logits * sm_scale * 1.44269504).astype(jnp.float32)
 
     q_span_logits = (q_tile_idx * blk_q) + jax.lax.broadcasted_iota(
         jnp.int32, logits.shape, 0
@@ -124,8 +125,8 @@ def _flash_attention_kernel(
 
     m_curr = jnp.max(logits, axis=1)[:, None]
     m_next = jnp.maximum(m_p, m_curr)
-    p = jnp.exp(logits - m_next)
-    alpha = jnp.exp(m_p - m_next)
+    p = jnp.exp2(logits - m_next)
+    alpha = jnp.exp2(m_p - m_next)
     l_next = l_p * alpha + jnp.sum(p, axis=1)[:, None]
     acc_next = acc_p * alpha + jax.lax.dot_general(
         p.astype(v.dtype),
@@ -243,7 +244,7 @@ def _flash_attention_kernel_hd64(
     logits = jax.lax.dot_general(
         q, kv, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
     )
-    logits = (logits * sm_scale).astype(jnp.float32)
+    logits = (logits * sm_scale * 1.44269504).astype(jnp.float32)
 
     q_span_logits = (q_tile_idx * blk_q) + jax.lax.broadcasted_iota(
         jnp.int32, logits.shape, 0
@@ -256,8 +257,8 @@ def _flash_attention_kernel_hd64(
 
     m_curr = jnp.max(logits, axis=1)[:, None]
     m_next = jnp.maximum(m_p, m_curr)
-    p = jnp.exp(logits - m_next)
-    alpha = jnp.exp(m_p - m_next)
+    p = jnp.exp2(logits - m_next)
+    alpha = jnp.exp2(m_p - m_next)
     l_next = l_p * alpha + jnp.sum(p, axis=1)[:, None]
 
     acc_next = acc_p * alpha + jax.lax.dot_general(
@@ -292,6 +293,17 @@ def flash_attention(
   grid = (batch, heads, (q_len + blk_q - 1) // blk_q)
   kv_tiles = (kv_len + blk_kv - 1) // blk_kv
 
+  flops = 4 * batch * heads * q_len * kv_len * head_dim
+  input_bytes = (
+      math.prod(q.shape) * q.dtype.itemsize
+      + math.prod(k.shape) * k.dtype.itemsize
+      + math.prod(v.shape) * v.dtype.itemsize
+  )
+  output_bytes = math.prod(q.shape) * q.dtype.itemsize
+  cost_estimate = pl.CostEstimate(
+      flops=flops, bytes_accessed=input_bytes + output_bytes, transcendentals=0
+  )
+
   if head_dim == 64:
     kv_merged = jnp.concatenate([k, v], axis=-1)
     q_padded = jnp.pad(
@@ -317,9 +329,7 @@ def flash_attention(
             ],
             out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
             scratch_shapes=[
-                pltpu.VMEM(
-                    (2, blk_kv, head_dim_x2), q.dtype
-                ),
+                pltpu.VMEM((2, blk_kv, head_dim_x2), q.dtype),
                 pltpu.SemaphoreType.DMA((3, 2)),
                 pltpu.VMEM((blk_q, 1), jnp.float32),
                 pltpu.VMEM((blk_q, 1), jnp.float32),
@@ -335,6 +345,7 @@ def flash_attention(
             dimension_semantics=("parallel", "parallel", "parallel"),
             disable_bounds_checks=True,
         ),
+        cost_estimate=cost_estimate,
     )(sm_scale, kv_seq_len_arr, q_padded, kv_merged)
 
     return out_padded[..., 64:]
@@ -373,4 +384,5 @@ def flash_attention(
             dimension_semantics=("parallel", "parallel", "parallel"),
             disable_bounds_checks=True,
         ),
+        cost_estimate=cost_estimate,
     )(sm_scale, kv_seq_len_arr, q, k, v)
