@@ -11,11 +11,40 @@ import example_utils
 import jax_kernel
 
 
-def run_benchmark(
-    name, batch, heads, q_len, kv_len, dim, blk_q=128, blk_kv=128
-):
+# Best tuned block sizes for Simplified Kernel: (blk_q, blk_kv)
+SIMPLIFIED_TUNED_CONFIGS = {
+    (1024, 1024, 64): (1024, 1024),
+    (1024, 4096, 64): (1024, 4096),
+    (4096, 1024, 64): (4096, 1024),
+    (4096, 4096, 64): (1024, 4096),
+    (1024, 1024, 128): (1024, 1024),
+    (1024, 4096, 128): (1024, 4096),
+    (4096, 1024, 128): (4096, 1024),
+    (4096, 4096, 128): (1024, 4096),
+}
+
+# Best tuned block sizes for JAX Kernel: (blk_q, blk_k_major, blk_k, blk_b)
+JAX_TUNED_CONFIGS = {
+    (1024, 1024, 64): (512, 512, 128, 1),
+    (1024, 4096, 64): (512, 512, 128, 1),
+    (4096, 1024, 64): (512, 512, 128, 1),
+    (4096, 4096, 64): (512, 512, 128, 1),
+    (1024, 1024, 128): (512, 512, 128, 1),
+    (1024, 4096, 128): (512, 512, 128, 1),
+    # Note: Using a safe fallback for 4K/128 as (4096, 512, 512, 2) OOMs VMEM
+    (4096, 1024, 128): (512, 512, 128, 1),
+    (4096, 4096, 128): (512, 512, 128, 1),
+}
+
+
+def run_benchmark(name, batch, heads, q_len, kv_len, dim):
   print(f"\n--- Benchmarking: {name} ---")
   print(f"Shape: B={batch}, H={heads}, Q={q_len}, KV={kv_len}, D={dim}")
+
+  # Lookup configs
+  key = (q_len, kv_len, dim)
+  simp_config = SIMPLIFIED_TUNED_CONFIGS.get(key, (1024, 1024))
+  jax_config = JAX_TUNED_CONFIGS.get(key, (1024, 1024, 128, 1))
 
   q, k, v = example_utils.sample_qkv(
       batch, heads, q_len, kv_len, dim, dtype=jnp.bfloat16
@@ -24,22 +53,27 @@ def run_benchmark(
   sm_scale = 1.0 / (dim**0.5)
 
   # Total theoretical FLOPs for Forward Flash Attention
-  # 2 * (Q @ K^T) + 2 * (P @ V)
   total_flops = 4.0 * batch * heads * q_len * kv_len * dim
 
   # 1. Simplified Kernel
   def run_simplified():
     return simplified_kernel.flash_attention(
-        q, k, v, blk_q=blk_q, blk_kv=blk_kv
+        q, k, v, blk_q=simp_config[0], blk_kv=simp_config[1]
     )
 
   lowered_s = jax.jit(run_simplified).lower()
   compiled_s = lowered_s.compile()
 
-  start = time.time()
+  # Warmup
   res_s = compiled_s()
   res_s.block_until_ready()
-  time_s = time.time() - start
+
+  num_iters = 100
+  start = time.time()
+  for _ in range(num_iters):
+    res_s = compiled_s()
+    res_s.block_until_ready()
+  time_s = (time.time() - start) / num_iters
 
   flops_s = (
       compiled_s.cost_analysis()[0].get("flops", 0)
@@ -49,7 +83,10 @@ def run_benchmark(
 
   # 2. OSS JAX Kernel
   block_sizes = jax_kernel.BlockSizes(
-      block_q=blk_q, block_k_major=blk_kv, block_k=128, block_b=1
+      block_q=jax_config[0],
+      block_k_major=jax_config[1],
+      block_k=jax_config[2],
+      block_b=jax_config[3],
   )
 
   def run_oss():
@@ -60,10 +97,16 @@ def run_benchmark(
   lowered_o = jax.jit(run_oss).lower()
   compiled_o = lowered_o.compile()
 
-  start = time.time()
+  # Warmup
   res_o = compiled_o()
   res_o.block_until_ready()
-  time_o = time.time() - start
+
+  start = time.time()
+  for _ in range(num_iters):
+    res_o = compiled_o()
+    res_o.block_until_ready()
+  time_o = (time.time() - start) / num_iters
+
   flops_o = (
       compiled_o.cost_analysis()[0].get("flops", 0)
       if isinstance(compiled_o.cost_analysis(), list)
@@ -92,6 +135,13 @@ def main(argv: Sequence[str]) -> None:
       ("Meta/Helion Use Case (Long Seq)", 2, 32, 4096, 4096, 64),
       ("Large Seq", 1, 8, 2048, 8192, 128),
       ("Wide Head", 1, 16, 1024, 1024, 256),
+      # Additional Tuned Cases
+      ("Tuned 1K_4K_64", 2, 32, 1024, 4096, 64),
+      ("Tuned 4K_1K_64", 2, 32, 4096, 1024, 64),
+      ("Tuned 1K_1K_128", 2, 32, 1024, 1024, 128),
+      ("Tuned 1K_4K_128", 2, 32, 1024, 4096, 128),
+      ("Tuned 4K_1K_128", 2, 32, 4096, 1024, 128),
+      ("Tuned 4K_4K_128", 2, 32, 4096, 4096, 128),
   ]
 
   for name, b, h, ql, kl, d in cases:
