@@ -175,7 +175,7 @@ def _fp8_flash_attention_kernel_hd64(
     # 2nd Matmul: P (bf16/f32) @ V (fp8)
     acc_next = acc_p * alpha_f32 + jax.lax.dot_general(
         p_f32.astype(jnp.bfloat16),
-        v_fp8,
+        kv_fp8,
         (((1,), (0,)), ((), ())),
         preferred_element_type=jnp.float32,
     )
